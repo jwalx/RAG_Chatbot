@@ -290,8 +290,8 @@ if not st.session_state.selected_index and available_indexes:
     st.session_state.selected_index = available_indexes[0]
 
 # --- UI Rendering ---
-st.title("🤖 RAG-based Chatbot POC")
-st.markdown("*Powered by Google Gemini Flash Lite and Embedding 001*")
+st.title("🤖 DOCGINI RAG-based Chatbot ")
+st.markdown("*Powered by Docgini*")
 
 # Sidebar
 with st.sidebar:
@@ -409,4 +409,4 @@ elif section == "💬 Chat Interface":
 
 # Footer
 st.markdown("---")
-st.markdown("*Built with Streamlit, Google Gemini API, and FAISS*")
+st.markdown("*Built with OSS*")
