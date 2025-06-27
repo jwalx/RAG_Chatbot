@@ -18,7 +18,7 @@ A **Proof-of-Concept (PoC)** for a **Retrieval-Augmented Generation (RAG)** chat
 - **Context-Aware Responses**: Generates answers using both retrieved document context and the ongoing conversation history.
 - **Conversation Memory**: Understands follow-up questions by maintaining multi-turn conversation context.
 - **Source References**: Shows which source documents were used to generate an answer.
-- **Downloadable Sources**: Provides download links for the referenced documents directly in the chat.
+- **Source Highlighting**: Displays the exact document chunks used to generate an answer, providing full transparency.
 - **Adjustable Retrieval**: Allows configuration of how many document chunks to retrieve (top-k).
 - **Chat History**: Maintains and displays the full conversation during the session.
 
@@ -83,7 +83,7 @@ The application will open in your browser at `http://localhost:8501`
 2. The chat will query against the index you last selected in the RAG Management section.
 3. Type your question in the chat input.
 4. Receive AI-generated answers based on your documents, with conversational context.
-5. Expand the **"References"** section below an answer to see which documents were used and download them.
+5. Expand the **"References"** section below an answer to see the exact source text that informed the response.
 
 ## 🏗️ Architecture
 

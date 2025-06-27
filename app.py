@@ -9,18 +9,17 @@ from typing import List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 import time
-import PyPDF2
+import fitz  # PyMuPDF
 from io import BytesIO
 import re
 from dotenv import load_dotenv
+import os
+from contextlib import redirect_stderr
 
 from data_models import DocumentChunk
 
 # Load environment variables
 load_dotenv()
-
-# Directory for source documents
-SOURCE_DOCS_DIR = "source_documents"
 
 # Configure Streamlit page
 st.set_page_config(
@@ -117,12 +116,14 @@ class RAGSystem:
             st.error(f"Error saving index '{index_name}': {str(e)}")
 
     def extract_text_from_pdf(self, pdf_file) -> str:
-        """Extract text from PDF file"""
+        """Extract text from PDF file using PyMuPDF, suppressing MuPDF errors."""
         try:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+            file_bytes = pdf_file.read()
+            # PyMuPDF can be noisy with non-critical errors, so we suppress them
+            with open(os.devnull, 'w') as devnull:
+                with redirect_stderr(devnull):
+                    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                        text = "\n".join(page.get_text() for page in doc)
             return text
         except Exception as e:
             st.error(f"Error extracting text from PDF: {str(e)}")
@@ -236,9 +237,8 @@ class RAGSystem:
             st.error(f"Error during search in index '{index_name}': {str(e)}")
             return []
 
-    def generate_response(self, query: str, context_docs: List[DocumentChunk], chat_history: List[dict]) -> tuple[str, list[str]]:
+    def generate_response(self, query: str, context_docs: List[DocumentChunk], chat_history: List[dict]) -> tuple[str, list[DocumentChunk]]:
         """Generate response using Gemini with retrieved context and conversation history."""
-        sources = sorted(list(set(doc.source for doc in context_docs)))
         context = "\n".join([doc.content for doc in context_docs])
 
         # Construct conversation history string
@@ -271,7 +271,7 @@ class RAGSystem:
         try:
             model = genai.GenerativeModel(self.generation_model)
             response = model.generate_content(prompt)
-            return response.text, sources
+            return response.text, context_docs
         except Exception as e:
             return f"Error generating response: {str(e)}", []
 
@@ -339,18 +339,7 @@ with st.sidebar:
             )
             if uploaded_files and st.button("Process Documents", type="primary"):
                 with st.spinner("Processing documents..."):
-                    if not os.path.exists(SOURCE_DOCS_DIR):
-                        os.makedirs(SOURCE_DOCS_DIR)
-                        
                     for uploaded_file in uploaded_files:
-                        # Save the uploaded file for download
-                        file_path = os.path.join(SOURCE_DOCS_DIR, uploaded_file.name)
-                        with open(file_path, "wb") as f:
-                            f.write(uploaded_file.getbuffer())
-                            
-                        # Reset buffer for text extraction
-                        uploaded_file.seek(0)
-
                         text = rag_system.extract_text_from_pdf(uploaded_file) if uploaded_file.type == "application/pdf" else uploaded_file.read().decode("utf-8")
                         if text.strip():
                             rag_system.add_documents(st.session_state.selected_index, [text], uploaded_file.name)
@@ -398,19 +387,9 @@ elif section == "💬 Chat Interface":
                 st.markdown(f"**🤖 Assistant:** {message['answer']}")
                 if message.get("sources"):
                     with st.expander("References"):
-                        for source in message["sources"]:
-                            file_path = os.path.join(SOURCE_DOCS_DIR, source)
-                            if os.path.exists(file_path):
-                                with open(file_path, "rb") as f:
-                                    st.download_button(
-                                        label=f"📄 {source}",
-                                        data=f,
-                                        file_name=source,
-                                        mime='application/octet-stream', # Generic binary file type
-                                        key=f"download_{i}_{source}"
-                                    )
-                            else:
-                                st.markdown(f"- {source} (file not available for download)")
+                        for i, doc in enumerate(message["sources"]):
+                            st.markdown(f"**Source {i+1}:** *{doc.source}* (Chunk {doc.chunk_id})")
+                            st.info(doc.content)
                 st.divider()
 
         with st.form("chat_form", clear_on_submit=True):
