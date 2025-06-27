@@ -13,10 +13,12 @@ import fitz  # PyMuPDF
 from io import BytesIO
 import re
 from dotenv import load_dotenv
-import os
-from contextlib import redirect_stderr
+import logging
 
 from data_models import DocumentChunk
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +69,7 @@ class RAGSystem:
             return
         self.indexes[index_name] = {"index": None, "documents": []}
         self.save_index(index_name)
+        logging.info(f"Index '{index_name}' created successfully.")
         st.success(f"Index '{index_name}' created successfully.")
 
     def delete_index(self, index_name: str):
@@ -82,18 +85,40 @@ class RAGSystem:
             st.warning(f"No saved file found for index '{index_name}'.")
 
     def load_index(self, index_name: str):
-        """Load a specific index from disk into memory"""
+        """Load documents from disk and rebuild the FAISS index in memory."""
         index_path = self.get_index_path(index_name)
         try:
             if os.path.exists(index_path):
+                if os.path.getsize(index_path) == 0:
+                    raise EOFError("Index file is empty.")
+                
                 with open(index_path, "rb") as f:
                     data = pickle.load(f)
+                    documents = data.get("documents", [])
+                    
+                    # Rebuild the FAISS index from the documents' embeddings
+                    faiss_index = None
+                    if documents:
+                        all_embeddings = [doc.embedding for doc in documents if doc.embedding is not None]
+                        if all_embeddings:
+                            dimension = len(all_embeddings[0])
+                            faiss_index = faiss.IndexFlatIP(dimension)
+                            embeddings_array = np.array(all_embeddings).astype("float32")
+                            faiss.normalize_L2(embeddings_array)
+                            faiss_index.add(embeddings_array)
+
                     self.indexes[index_name] = {
-                        "index": data.get("index"),
-                        "documents": data.get("documents", []),
+                        "index": faiss_index,
+                        "documents": documents,
                     }
+        except (pickle.UnpicklingError, EOFError) as e:
+            st.warning(f"Corrupt or empty index '{index_name}' found and deleted. Please re-process documents for this index.")
+            if os.path.exists(index_path):
+                os.remove(index_path)
+            if index_name in self.indexes:
+                del self.indexes[index_name]
         except Exception as e:
-            st.warning(f"Could not load index '{index_name}': {str(e)}")
+            st.error(f"An unexpected error occurred while loading index '{index_name}': {str(e)}")
             if index_name in self.indexes:
                 del self.indexes[index_name]
 
@@ -103,27 +128,38 @@ class RAGSystem:
             self.load_index(index_name)
 
     def save_index(self, index_name: str):
-        """Save a specific index from memory to disk"""
+        """Save only the document data to disk. The FAISS index is rebuilt on load."""
         if index_name not in self.indexes:
-            st.error(f"Index '{index_name}' not found in memory.")
+            st.warning(f"Index '{index_name}' not found in memory.")
             return
 
         index_path = self.get_index_path(index_name)
         try:
+            # We only save the documents, which include the embeddings.
+            # The FAISS index will be rebuilt on load to avoid serialization bugs.
+            data_to_save = {
+                "documents": self.indexes[index_name].get("documents", [])
+            }
+            
             with open(index_path, "wb") as f:
-                pickle.dump(self.indexes[index_name], f)
+                pickle.dump(data_to_save, f)
+            logging.info(f"Successfully saved document data for index '{index_name}' to {index_path}")
         except Exception as e:
             st.error(f"Error saving index '{index_name}': {str(e)}")
+            logging.error(f"Failed to save index '{index_name}': {e}", exc_info=True)
 
     def extract_text_from_pdf(self, pdf_file) -> str:
-        """Extract text from PDF file using PyMuPDF, suppressing MuPDF errors."""
+        """Extract text from PDF file using PyMuPDF"""
         try:
-            file_bytes = pdf_file.read()
-            # PyMuPDF can be noisy with non-critical errors, so we suppress them
-            with open(os.devnull, 'w') as devnull:
-                with redirect_stderr(devnull):
-                    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                        text = "\n".join(page.get_text() for page in doc)
+            # PyMuPDF needs bytes, so we read the uploaded file
+            pdf_bytes = pdf_file.read()
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            text = ""
+            for page in doc:
+                text += page.get_text() + "\n"
+            doc.close()
+            # Reset buffer for any subsequent operations if needed
+            pdf_file.seek(0)
             return text
         except Exception as e:
             st.error(f"Error extracting text from PDF: {str(e)}")
@@ -171,19 +207,10 @@ class RAGSystem:
         progress_text.empty()
         return embeddings
 
-    def create_faiss_index(self, embeddings: List[np.ndarray]) -> faiss.Index:
-        """Create FAISS index from embeddings"""
-        if not embeddings:
-            return None
-        dimension = len(embeddings[0])
-        index = faiss.IndexFlatIP(dimension)
-        embeddings_array = np.array(embeddings).astype("float32")
-        faiss.normalize_L2(embeddings_array)
-        index.add(embeddings_array)
-        return index
+
 
     def add_documents(self, index_name: str, texts: List[str], source: str):
-        """Add documents to a specific index"""
+        """Add documents to a specific index by updating the existing FAISS index."""
         if index_name not in self.indexes:
             st.error(f"Index '{index_name}' does not exist. Please create it first.")
             return
@@ -198,8 +225,15 @@ class RAGSystem:
             st.warning("No text chunks generated from the documents")
             return
 
-        embeddings = self.generate_embeddings(all_chunks)
-        current_docs = self.indexes[index_name]["documents"]
+        # Generate embeddings only for the new chunks
+        new_embeddings = self.generate_embeddings(all_chunks)
+        
+        # Get current index data
+        index_data = self.indexes[index_name]
+        current_docs = index_data.get("documents", [])
+        faiss_index = index_data.get("index")
+
+        # Create new DocumentChunk objects
         new_documents = [
             DocumentChunk(
                 content=chunk,
@@ -207,13 +241,29 @@ class RAGSystem:
                 chunk_id=len(current_docs) + i,
                 embedding=embedding,
             )
-            for i, (chunk, embedding) in enumerate(zip(all_chunks, embeddings))
+            for i, (chunk, embedding) in enumerate(zip(all_chunks, new_embeddings))
         ]
 
+        # Append new documents to the list
         current_docs.extend(new_documents)
         self.indexes[index_name]["documents"] = current_docs
-        all_embeddings = [doc.embedding for doc in current_docs]
-        self.indexes[index_name]["index"] = self.create_faiss_index(all_embeddings)
+
+        # Prepare new embeddings for FAISS
+        new_embeddings_array = np.array(new_embeddings).astype("float32")
+        faiss.normalize_L2(new_embeddings_array)
+
+        # If index doesn't exist, create it. Otherwise, add to it.
+        if faiss_index is None:
+            dimension = len(new_embeddings[0])
+            faiss_index = faiss.IndexFlatIP(dimension)
+            faiss_index.add(new_embeddings_array)
+        else:
+            faiss_index.add(new_embeddings_array)
+        
+        # Update the index in memory
+        self.indexes[index_name]["index"] = faiss_index
+
+        # Save the updated index to disk
         self.save_index(index_name)
         st.success(f"Added {len(all_chunks)} chunks from {source} to index '{index_name}'")
 
@@ -290,8 +340,8 @@ if not st.session_state.selected_index and available_indexes:
     st.session_state.selected_index = available_indexes[0]
 
 # --- UI Rendering ---
-st.title("🤖 DOCGINI RAG-based Chatbot ")
-st.markdown("*Powered by Docgini*")
+st.title("🤖 RAG-based Chatbot POC")
+st.markdown("*Powered by Google Gemini Flash Lite and Embedding 001*")
 
 # Sidebar
 with st.sidebar:
@@ -409,4 +459,4 @@ elif section == "💬 Chat Interface":
 
 # Footer
 st.markdown("---")
-st.markdown("*Built with OSS*")
+st.markdown("*Built with Streamlit, Google Gemini API, and FAISS*")
